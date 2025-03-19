@@ -4349,21 +4349,32 @@ ConstraintSystem::matchExistentialTypes(Type type1, Type type2,
       } else {
         // The source type is a concrete type.
         //
-        // Substitute the source into the requirements of the parameterized type
-        // and discharge the requirements of the parameterized protocol.
+        // Extract the type arguments from the parameterized protocol
+        // and match them directly against the concrete type arguments.
         //
-        // FIXME: Extend the locator path to point to the argument
-        // inducing the requirement.
-        SmallVector<Requirement, 2> reqs;
-        parameterizedType->getRequirements(type1, reqs);
-        for (const auto &req : reqs) {
-          assert(req.getKind() == RequirementKind::SameType);
-          auto result = matchTypes(req.getFirstType(), req.getSecondType(),
-                                   ConstraintKind::Bind,
-                                   subflags, locator);
-          if (result.isFailure())
-            return result;
-        }
+        // The locator is extended within `matchDeepTypeArguments` to
+        // precisely track which generic argument is causing a mismatch.
+        SmallVector<Type> subjectArgs, protoArgs;
+        parameterizedType->getMatchingTypeArguments(type1, subjectArgs,
+                                                    protoArgs);
+        subflags = TMF_GenerateConstraints;
+        if (!shouldAttemptFixes())
+          return matchDeepTypeArguments(*this, subflags, subjectArgs, protoArgs,
+                                        locator);
+        subflags |= TMF_MatchingGenericArguments;
+        subflags |= TMF_ApplyingFix;
+        unsigned numMismatches = 0;
+        auto result = matchDeepTypeArguments(
+            *this, subflags, subjectArgs, protoArgs, locator,
+            [&numMismatches](auto) { ++numMismatches; });
+        if (numMismatches == 0)
+          continue;
+        if (!isExpr<AssignExpr>(locator.getAnchor()))
+          return result;
+        if (!recordFix(IgnoreAssignmentDestinationType::create(
+                           *this, type1, type2, getConstraintLocator(locator)),
+                       /*impact=*/numMismatches))
+          return result;
       }
     }
   }
@@ -6843,8 +6854,19 @@ bool ConstraintSystem::repairFailures(
       }
     }
 
-    if (!fromType || !toType)
+    if (!fromType || !toType) {
+      // If we are anchored at an assignment and there is a mismatch between
+      // generic arguments, this implies a source/destination type mismatch.
+      if (auto assignment = getAsExpr<AssignExpr>(locator.getAnchor())) {
+        auto srcType = getType(assignment->getSrc());
+        auto destType = getType(assignment->getDest());
+        if (srcType && destType) {
+          conversionsOrFixes.push_back(IgnoreAssignmentDestinationType::create(
+              *this, srcType, destType, getConstraintLocator(locator)));
+        }
+      }
       break;
+    }
 
     Type fromObjectType, toObjectType;
     unsigned fromUnwraps, toUnwraps;
@@ -7405,6 +7427,7 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
 
       auto *tuple1 = cast<TupleType>(desugar1);
       auto *tuple2 = cast<TupleType>(desugar2);
+
       if (delayMatching(tuple1) || delayMatching(tuple2)) {
         return formUnsolvedResult();
       }
