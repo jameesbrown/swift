@@ -4356,13 +4356,16 @@ ConstraintSystem::matchExistentialTypes(Type type1, Type type2,
         // inducing the requirement.
         SmallVector<Requirement, 2> reqs;
         parameterizedType->getRequirements(type1, reqs);
+        unsigned idx = 0;
         for (const auto &req : reqs) {
           assert(req.getKind() == RequirementKind::SameType);
-          auto result = matchTypes(req.getFirstType(), req.getSecondType(),
-                                   ConstraintKind::Bind,
-                                   subflags, locator);
+          auto result = matchTypes(
+              req.getFirstType(), req.getSecondType(), ConstraintKind::Bind,
+              subflags,
+              locator.withPathElement(LocatorPathElt::GenericArgument(idx)));
           if (result.isFailure())
             return result;
+          ++idx;
         }
       }
     }
@@ -4837,6 +4840,56 @@ static bool canBridgeThroughCast(ConstraintSystem &cs, Type fromType,
   }
 
   return true;
+}
+
+/// Attempts to repair an assignment failure by checking whether the source type
+/// conforms to the destination type and satisfies all implied type
+/// requirements. If a missing conformance or an unmet type requirement is
+/// detected, a fix is added to `conversionsOrFixes`.
+///
+/// \returns `true` if a fix was added, `false` otherwise.
+static bool repairViaConformanceToDestinationType(
+    ConstraintSystem &cs, SmallVectorImpl<RestrictionOrFix> &conversionsOrFixes,
+    ConstraintLocatorBuilder locator) {
+  auto *assignment = getAsExpr<AssignExpr>(locator.getAnchor());
+  if (!assignment)
+    return false;
+
+  auto *existential = cs.getType(assignment->getDest())
+                          ->getWithoutSpecifierType()
+                          ->getAs<ExistentialType>();
+  if (!existential)
+    return false;
+
+  auto srcType = cs.getType(assignment->getSrc());
+  auto layout = existential->getExistentialLayout();
+
+  // Check conformance of the source type to the required protocols.
+  for (auto proto : layout.getParameterizedProtocols()) {
+    if (lookupConformance(srcType, proto->getProtocol()).isInvalid()) {
+      conversionsOrFixes.push_back(MissingConformance::forContextual(
+          cs, srcType, existential, cs.getConstraintLocator(locator)));
+      return true;
+    }
+
+    // Ensure the source type satisfies any additional type requirements.
+    SmallVector<Requirement, 2> reqs;
+    proto->getRequirements(srcType, reqs);
+    for (const auto &req : reqs) {
+      if (req.getKind() != RequirementKind::SameType)
+        continue;
+
+      if (cs.matchTypes(
+                req.getFirstType(), req.getSecondType(), ConstraintKind::Bind,
+                ConstraintSystem::TypeMatchFlags::TMF_ApplyingFix, locator)
+              .isFailure()) {
+        conversionsOrFixes.push_back(IgnoreAssignmentDestinationType::create(
+            cs, srcType, existential, cs.getConstraintLocator(locator)));
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 static bool
@@ -6843,8 +6896,12 @@ bool ConstraintSystem::repairFailures(
       }
     }
 
-    if (!fromType || !toType)
+    if (!fromType || !toType) {
+      if (repairViaConformanceToDestinationType(*this, conversionsOrFixes,
+                                                locator))
+        return true;
       break;
+    }
 
     Type fromObjectType, toObjectType;
     unsigned fromUnwraps, toUnwraps;
